@@ -291,6 +291,9 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         want = false;   // (v2.0.9: off by default with the write-back diff until issue 1161's device lost is placed; was:
         (void)dp;       //  NVIDIA's driver on Windows. RX_VK_PRESENT_QUEUE=1: on)
+        // (the wait it took away is gone on the replay's own queue since: a submit that finds a present under way is left
+        // with it, vk_replay.cpp's submit handover. Running in Hyrule Field at 4x: 55.4 fps without either, 59.3 with this
+        // queue, 59.1 with the handover)
 #endif
         if (const char* e = getenv("RX_VK_PRESENT_QUEUE")) want = atoi(e) != 0;
         for (uint32_t i = 0; want && i < n && compute_family == UINT32_MAX; i++)

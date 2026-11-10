@@ -87,6 +87,9 @@ enum { FR_OTHER, FR_POLL, FR_WAIT, FR_SLOT, FR_PRESENT, FR_CAP, FR_VALUE, FR_COU
 int64_t st_reason[FR_COUNT];
 int flush_reason = FR_OTHER;
 std::chrono::steady_clock::time_point pend_since;
+// (hookshot: something is held in pend. A flush that would send nothing does not take dev.present_mu for it: without
+// RX_VK_BATCH nothing is ever held, and the game's progress polls and its waits queued up behind each present there)
+std::atomic<bool> pend_any{false};
 
 struct Recording {
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -104,6 +107,9 @@ struct Recording {
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
     uint64_t batch = 0;   // (RX_VK_BATCH: the batch it went out in, waited for on batch_tl; 0: its own fence)
+    // (hookshot: the submit handover below. 1: its submit was left with a present that has the queue and is not sent yet;
+    // 2: sent, and it failed)
+    std::atomic<uint8_t> handed{0};
 };
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
@@ -111,9 +117,99 @@ constexpr int kRecordings = 48;   // (test: 24 before; with RX_VK_BATCH the ring
 Recording recordings[kRecordings];
 int recording_index = 0;
 
+// ---- (hookshot) the submit handover: a submit that finds a present under way is left with it ----
+// vkQueuePresentKHR blocks with dev.present_mu held (the queue is one thread's at a time): ~0.8 ms a present with frame
+// interpolation at 4x and up to 8 on an RTX 5070 Ti, a quarter of the display thread's time, and the game's main and
+// presentation threads waited there to submit, ~9% and ~15% of theirs. A queue of the presents' own took that wait away
+// (RX_VK_PRESENT_QUEUE=1, v2.0.8), but with frame interpolation the device was lost on some PCs (issue 1161: an RTX 4090 and
+// an RTX 5070 on NVIDIA's 621 driver, where others on it ran), and it is off by default since. Here the queue stays the one
+// it was: a recording's submit that comes while a present has the queue is left in a list instead of waiting, and the
+// presenting thread sends the list, in the order it came, once its present returns and before it lets the queue go. The
+// driver sees the calls it saw before, in the same order, one thread at a time; only the waiting threads go on. Whoever
+// takes dev.present_mu after a present finds the list sent. RX_VK_SUBMIT_HANDOVER=0: the submits wait, as before
+struct Handed {
+    VkCommandBufferSubmitInfo cb[2];
+    VkSemaphoreSubmitInfo sig[2];
+    uint32_t n, nsig;
+    Recording* r;
+};
+std::mutex handed_mu;
+std::vector<Handed> handed;    // (handed_mu)
+bool presenting = false;       // (handed_mu: a present has the queue, and takes what is left here)
+std::atomic<int64_t> st_handed{0}, st_handable{0};
+bool handover_on() {
+    static const bool on = !getenv("RX_VK_SUBMIT_HANDOVER") || atoi(getenv("RX_VK_SUBMIT_HANDOVER")) != 0;
+    return on;
+}
+/// A recording's own submit, or what it left to say when it fails (dev.present_mu held)
+void submit_now(const VkSubmitInfo2& si, Recording& r, bool was_handed);
+/// (dev.present_mu held, by the thread about to present on dev.queue) submits are left with this thread from here on
+void handover_begin() {
+    if (!handover_on()) return;
+    std::lock_guard hk(handed_mu);
+    presenting = true;
+}
+/// A recording's submit left with the present that has the queue: true when one has it (that thread sends it, handover_end)
+bool handover_leave(const Handed& h) {
+    st_handable++;
+    std::lock_guard hk(handed_mu);
+    if (!presenting) return false;
+    h.r->submitted = true;
+    h.r->handed.store(1);   // (before it is in the list: the presenting thread's answer comes after)
+    handed.push_back(h);
+    st_handed++;
+    return true;
+}
+/// (dev.present_mu held, its present back) the submits left meanwhile sent, in order; the queue is then anyone's again
+void handover_end() {
+    if (!handover_on()) return;
+    {   // (every 1200 presents: how many submits were left with one)
+        static int64_t presents, h0, s0;
+        if (++presents % 1200 == 0) {
+            const int64_t h = st_handed.load(), s = st_handable.load();
+            if (h > h0)
+                logf("vk: submit handover: %lld of %lld submits left with a present over 1200 presents (RX_VK_SUBMIT_HANDOVER=0: they "
+                     "wait for it)", (long long)(h - h0), (long long)(s - s0));
+            h0 = h, s0 = s;
+        }
+    }
+    std::vector<Handed> take;
+    for (;;) {
+        {
+            std::lock_guard hk(handed_mu);
+            if (handed.empty()) {   // (under the list's lock: none is left behind once presenting is false)
+                presenting = false;
+                return;
+            }
+            take.swap(handed);
+        }
+        for (Handed& h : take) {
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.commandBufferInfoCount = h.n;
+            si.pCommandBufferInfos = h.cb;
+            si.signalSemaphoreInfoCount = h.nsig;
+            si.pSignalSemaphoreInfos = h.nsig ? h.sig : nullptr;
+            submit_now(si, *h.r, true);
+        }
+        take.clear();
+    }
+}
+
+/// A recording's submit is out (true), or it was left with a present and failed there (false): before its fence is waited for
+bool handover_sent(Recording& r) {
+    if (r.handed.load() == 1) {   // (left with a present that has not sent it yet: sent before that present lets the queue go)
+        std::lock_guard lk(dev.present_mu);
+    }
+    return r.handed.exchange(0) != 2;
+}
+
 /// (a recording slot's last submit done: before it is used again)
 void recording_wait(Recording& r) {
     if (!r.submitted) return;
+    if (!handover_sent(r)) {   // (no fence will come)
+        r.submitted = false;
+        return;
+    }
     if (r.batch) {
         {
             std::lock_guard lk(dev.present_mu);
@@ -189,6 +285,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     st_reason[flush_reason]++;
     flush_reason = FR_OTHER;
     pend.cbs.clear(), pend.any_signal = false, pend.signal = 0, pend.rec = 0;
+    pend_any.store(false, std::memory_order_release);
 }
 void queue_flush() {
     std::lock_guard lk(dev.present_mu);
@@ -201,6 +298,7 @@ void device_wait_idle_locked() {   // (dev.present_mu held)
 }
 namespace {
 void queue_flush_for(int why) {
+    if (!pend_any.load(std::memory_order_acquire)) return;   // (nothing held: the queue's lock is not needed)
     std::lock_guard lk(dev.present_mu);
     if (pend.cbs.empty()) return;
     flush_reason = why;
@@ -212,6 +310,7 @@ void queue_flush_for(int why) {
 // 413, 528)
 void queue_flush_poll() {
     static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 2000;
+    if (!pend_any.load(std::memory_order_acquire)) return;   // (nothing held: the queue's lock is not needed)
     std::lock_guard lk(dev.present_mu);
     if (pend.cbs.empty()) return;
     if (us > 0 && std::chrono::steady_clock::now() - pend_since < std::chrono::microseconds(us)) return;
@@ -339,9 +438,12 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     si.signalSemaphoreInfoCount = nsig;
     si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
+    // (hookshot: a present has the queue: left with it, not waited for. The submit handover, above)
+    if (handover_on() && !batch_on() && handover_leave(Handed{{cb[0], cb[1]}, {signals[0], signals[1]}, n, nsig, &r})) return;
     std::lock_guard lk(dev.present_mu);   // (one queue: submits and presents take turns)
     if (batch_on()) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
+        pend_any.store(true, std::memory_order_release);
         for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);
         if (signal_value) pend.signal = std::max(pend.signal, signal.value), pend.any_signal = true;
         if (seq) pend.rec = std::max(pend.rec, seq);
@@ -352,9 +454,14 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
         return;
     }
+    submit_now(si, r, false);
+}
+void submit_now(const VkSubmitInfo2& si, Recording& r, bool was_handed) {   // (dev.present_mu held)
     PROF(PROF_QSUBMIT);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
-    r.submitted = res == VK_SUCCESS;
+    // (a handed one's recording is its thread's again by now: it reads the outcome in recording_wait, behind this lock)
+    if (was_handed) r.handed.store(res == VK_SUCCESS ? 0 : 2);
+    else r.submitted = res == VK_SUCCESS;
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -3589,7 +3696,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         std::lock_guard pq(dev.present_queue_mu);
         res = vkQueuePresentKHR(dev.present_queue, &pi);
     } else {
+        handover_begin();   // (the submit handover: what comes while this present has the queue is sent after it, below)
         res = vkQueuePresentKHR(dev.queue, &pi);
+        handover_end();
     }
     reflex_presented();
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
